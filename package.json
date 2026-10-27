@@ -1,0 +1,8 @@
+{
+  "name":"lotecontabil-login-piloto",
+  "version":"7.0.0",
+  "private":true,
+  "type":"module",
+  "engines":{"node":">=20"},
+  "scripts":{"start":"node server.mjs", "local":"node local.mjs"}
+}
