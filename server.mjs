@@ -1,5 +1,5 @@
 import http from 'node:http';
-import { createHash, createHmac, randomBytes, scryptSync, timingSafeEqual } from 'node:crypto';
+import { createHmac, randomBytes, scryptSync, timingSafeEqual } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
@@ -19,11 +19,9 @@ const salt = createHmac('sha256', sessionSecret).update('password').digest();
 const expectedPassHash = scryptSync(password, salt, 64);
 const cookieName = 'lote_session';
 const DAY_MS = 24 * 60 * 60 * 1000;
-let activeSession = null;
 const failures = new Map();
 const appHtml = await readFile(path.join(root, 'public', 'app.html'), 'utf8');
 const loginHtml = await readFile(path.join(root, 'public', 'login.html'), 'utf8');
-function sha(v) { return createHash('sha256').update(v).digest('hex'); }
 function hmac(v) { return createHmac('sha256', sessionSecret).update(v).digest('hex'); }
 function parseCookies(req) {
   const out = {};
@@ -38,16 +36,28 @@ function ip(req) {
   }
   return req.socket.remoteAddress || '';
 }
-function isValid(req) {
-  if(!activeSession || Date.now() >= activeSession.expires) return false;
+// Sessões assinadas independentes. Não bloqueie por IP ou por dispositivo.
+function readSession(req) {
   const token = parseCookies(req)[cookieName];
-  if(!token || token.length !== 64 || !/^[a-f0-9]+$/i.test(token)) return false;
-  const currentHash = Buffer.from(sha(token));
-  const liveHash = Buffer.from(activeSession.hash);
-  if(currentHash.length !== liveHash.length || !timingSafeEqual(currentHash, liveHash)) return false;
-  if(activeSession.ipHash !== hmac(ip(req))) return false;
-  if(activeSession.agentHash !== hmac(req.headers['user-agent']||'')) return false;
-  return true;
+  if (!token || token.length > 1200) return null;
+  const parts = token.split('.');
+  if (parts.length !== 2 || !parts[0] || parts[0].length > 700 || !/^[a-f0-9]{64}$/i.test(parts[1])) return null;
+  const expected = Buffer.from(hmac(parts[0]), 'hex');
+  const provided = Buffer.from(parts[1], 'hex');
+  if (provided.length !== expected.length || !timingSafeEqual(provided, expected)) return null;
+  try {
+    const session = JSON.parse(Buffer.from(parts[0], 'base64url').toString('utf8'));
+    const now = Date.now();
+    if (session.u !== username || !Number.isSafeInteger(session.iat) || !Number.isSafeInteger(session.exp)) return null;
+    if (session.iat > now + 60_000 || session.exp <= now || session.exp <= session.iat || session.exp - session.iat > DAY_MS) return null;
+    return {expires:session.exp};
+  } catch { return null; }
+}
+function isValid(req) { return readSession(req) !== null; }
+function issueSession() {
+  const now = Date.now();
+  const payload = Buffer.from(JSON.stringify({u:username,iat:now,exp:now+DAY_MS,nonce:randomBytes(16).toString('hex')})).toString('base64url');
+  return {token: `${payload}.${hmac(payload)}`, expires: now+DAY_MS};
 }
 function headersForHtml() {return {
   'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store, max-age=0',
@@ -80,7 +90,7 @@ const server=http.createServer(async (req,res)=>{
   const method = req.method || 'GET';
   if(p==='/health' && method==='GET'){send(res,200,'ok',{'Content-Type':'text/plain'});return;}
   if(p==='/robots.txt' && method==='GET'){send(res,200,'User-agent: *\nDisallow: /\n',{'Content-Type':'text/plain'});return;}
-  if(p==='/api/session' && method==='GET') {if(!isValid(req)){json(res,401,{ok:false,message:'Sessão expirada ou encerrada por outro acesso.'});return;}json(res,200,{ok:true,username,expiresAt:activeSession.expires});return;}
+  if(p==='/api/session' && method==='GET') {const session=readSession(req);if(!session){json(res,401,{ok:false,message:'Sessão expirada. Entre novamente.'});return;}json(res,200,{ok:true,username,expiresAt:session.expires});return;}
   if(p==='/api/login' && method==='POST') {
     if(!allowedOrigin(req)){json(res,403,{ok:false,message:'Origem inválida'});return;}
     const address=ip(req);if(rateLimited(address)){json(res,429,{ok:false,message:'Muitas tentativas. Tente novamente mais tarde.'});return;}
@@ -91,15 +101,12 @@ const server=http.createServer(async (req,res)=>{
     const passOK = timingSafeEqual(passHash,expectedPassHash);
     if(!userOK || !passOK) {failed(address);json(res,401,{ok:false,message:'Usuário ou senha incorretos.'});return;}
     failures.delete(hmac(address));
-    const token=randomBytes(32).toString('hex');
-    activeSession={hash:sha(token),ipHash:hmac(address),agentHash:hmac(req.headers['user-agent']||''),expires:Date.now()+DAY_MS};
-    // Qualquer novo login substitui a sessao anterior, independentemente de IP.
-    send(res,200,JSON.stringify({ok:true,expiresAt:activeSession.expires}),{'Content-Type':'application/json; charset=utf-8','Set-Cookie':setCookie(token)});
+    const session=issueSession();
+    send(res,200,JSON.stringify({ok:true,expiresAt:session.expires}),{'Content-Type':'application/json; charset=utf-8','Set-Cookie':setCookie(session.token)});
     return;
   }
   if(p==='/api/logout' && method==='POST') {
     if(!allowedOrigin(req)){json(res,403,{ok:false});return;}
-    if(isValid(req))activeSession=null;
     send(res,200,JSON.stringify({ok:true}),{'Content-Type':'application/json; charset=utf-8','Set-Cookie':unsetCookie()});return;
   }
   if((p==='/'||p==='/login') && method==='GET') {
